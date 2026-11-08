@@ -256,13 +256,13 @@ class AppTests(unittest.IsolatedAsyncioTestCase):
             await self.app.listing(2,mode,self.mid,0)
         for field in ('genre','year','country'): await self.app.filters(2,field,0)
         await self.app.listing(2,'all',0,0)
-        rows=self.bot.send_message.call_args.kwargs['reply_markup'].inline_keyboard
+        rows=self.bot.send_message.call_args.kwargs['reply_markup'].keyboard
         self.assertTrue(any('Keyingi' in b.text for row in rows for b in row))
     async def test_serial_seasons_episodes_languages_quality(self):
         mid=self.db.create_with_asset(movie('300','series'),asset(season=1,episode=1))
         self.db.add_asset(mid,asset(season=1,episode=1,language='Russian',quality='1080p'))
         await self.app.play(2,mid); await self.app.episodes(2,mid,1,0); await self.app.variants(2,mid,1,1,0)
-        rows=self.bot.send_message.call_args.kwargs['reply_markup'].inline_keyboard
+        rows=self.bot.send_message.call_args.kwargs['reply_markup'].keyboard
         self.assertIn('Russian · 1080p',[b.text for row in rows for b in row])
     async def test_wizard_creates_full_movie(self):
         await self.app.admin_action(1,['add'])

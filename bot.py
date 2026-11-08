@@ -18,8 +18,8 @@ from urllib.parse import quote
 from aiogram import Bot, Dispatcher, BaseMiddleware
 from aiogram.exceptions import TelegramAPIError, TelegramForbiddenError, TelegramRetryAfter, TelegramBadRequest
 from aiogram.filters import Command
-from aiogram.types import (Message, CallbackQuery, InlineKeyboardButton,
-    InlineKeyboardMarkup, FSInputFile, BotCommand, ErrorEvent)
+from aiogram.types import (Message, CallbackQuery, KeyboardButton,
+    ReplyKeyboardMarkup, FSInputFile, BotCommand, ErrorEvent)
 from dotenv import load_dotenv
 
 from core import (FIELDS, WIZARD, OPTIONAL, allowed, code_value, validate,
@@ -34,11 +34,6 @@ CHOICES = {
     'language': [('O‘zbekcha', 'O‘zbekcha'), ('Ruscha', 'Ruscha'), ('Inglizcha', 'Inglizcha')],
     'quality': [('480p', '480p'), ('720p', '720p'), ('1080p', '1080p'), ('4K', '4K')],
 }
-
-def kb(rows):
-    return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text=text, **({'url':value} if value.startswith('https://') else {'callback_data':value}))
-        for text,value in row] for row in rows])
 
 def rows_of(items, n=1):
     return [items[i:i+n] for i in range(0,len(items),n)]
@@ -130,8 +125,40 @@ class App:
     def permit(self, uid, permission):
         return allowed(self.role(uid),permission)
 
+    def prepare_keyboard(self,uid,rows):
+        state=self.db.state(uid)
+        previous=self.db.keyboard(uid)
+        if rows is None:
+            if previous and previous.get('scope')==state:
+                return None, None  # Keep the currently visible keyboard.
+            rows=[[('✖️ Bekor qilish','admin' if self.role(uid) else 'home')]] if state else []
+        rows=[list(row) for row in rows]
+        if not any(action=='home' for row in rows for _,action in row):
+            rows.append([('🏠 Menyu','home')])
+        actions={}; buttons=[]
+        for row in rows:
+            rendered=[]
+            for label,action in row:
+                # Identical titles (e.g. channels) must still route independently.
+                base=label; number=2
+                while label in actions:
+                    label=f'{base} ({number})'; number+=1
+                actions[label]=action
+                rendered.append(KeyboardButton(text=label))
+            if rendered: buttons.append(rendered)
+        return ReplyKeyboardMarkup(keyboard=buttons,resize_keyboard=True,
+            is_persistent=True,one_time_keyboard=False,
+            input_field_placeholder='Tugmani tanlang yoki kino kodini yozing'), {'actions':actions,'scope':state}
+
+    async def send_with_keyboard(self,sender,uid,*args,rows=None,**kwargs):
+        markup,saved=self.prepare_keyboard(uid,rows)
+        result=await sender(uid,*args,reply_markup=markup,**kwargs)
+        if saved is not None:
+            self.db.set_keyboard(uid,saved)
+        return result
+
     async def say(self, uid, text, rows=None):
-        return await self.bot.send_message(uid,text,reply_markup=kb(rows) if rows else None)
+        return await self.send_with_keyboard(self.bot.send_message,uid,text,rows=rows)
 
     def clear_flow(self, uid):
         self.db.set_state(uid,None)
@@ -237,7 +264,7 @@ class App:
         if movie['poster']:
             try:
                 if utf16_length(text) <= 1024:
-                    await self.bot.send_photo(uid,movie['poster'],caption=text,reply_markup=kb(rows))
+                    await self.send_with_keyboard(self.bot.send_photo,uid,movie['poster'],caption=text,rows=rows)
                 else:
                     await self.bot.send_photo(uid,movie['poster'],caption=movie['title'])
                     await self.say(uid,text,rows)
@@ -270,13 +297,13 @@ class App:
         rows.append([('ℹ️ Kino haqida',f"view:{asset['movie_id']}"),('🏠 Menyu','home')])
         try:
             try:
-                await sender(uid,asset['file_id'],caption=caption,reply_markup=kb(rows))
+                await self.send_with_keyboard(sender,uid,asset['file_id'],caption=caption,rows=rows)
             except TelegramRetryAfter as exc:
                 if exc.retry_after > 3:
                     await self.say(uid,f'Telegram band. {exc.retry_after} soniyadan keyin qayta urinib ko‘ring.')
                     return
                 await asyncio.sleep(exc.retry_after+0.1)
-                await sender(uid,asset['file_id'],caption=caption,reply_markup=kb(rows))
+                await self.send_with_keyboard(sender,uid,asset['file_id'],caption=caption,rows=rows)
         except TelegramAPIError as exc:
             log.warning('Delivery failed asset=%s error=%s',aid,type(exc).__name__)
             await self.say(uid,'Video yuborilmadi. Birozdan keyin qayta urinib ko‘ring yoki xatolik yuboring.',
@@ -426,7 +453,7 @@ class App:
         permitted={value for _,value in CHOICES.get(field,[])}
         if field in OPTIONAL: permitted.add('/skip')
         if p[2]!=field or p[3] not in permitted: return
-        await self.message(SimpleNamespace(from_user=SimpleNamespace(id=uid),text=p[3],photo=None))
+        await self.message(SimpleNamespace(from_user=SimpleNamespace(id=uid),text=p[3],photo=None),keyboard_input=False)
 
     async def begin_asset(self,uid,mid,draft=None):
         m=draft or self.db.movie(mid,public=False)
@@ -466,7 +493,10 @@ class App:
         uid=c.from_user.id
         with contextlib.suppress(TelegramAPIError):
             await c.answer()
-        p=(c.data or '').split(':')
+        await self.dispatch_action(uid,c.data or '')
+
+    async def dispatch_action(self,uid,action):
+        p=action.split(':')
         try:
             if any(part.lstrip('-').isascii() and part.lstrip('-').isdigit() and
                    (len(part)>16 or not 0 <= int(part) < 2**52) for part in p):
@@ -655,9 +685,11 @@ class App:
         elif action=='reports':
             page=max(0,int(p[1]))
             data=self.db.all('SELECT r.*,m.code FROM reports r LEFT JOIN movies m ON m.id=r.movie_id WHERE r.resolved=0 ORDER BY r.id DESC LIMIT ? OFFSET ?',(PAGE+1,page*PAGE))
+            rows=[]
             for r in data[:PAGE]:
-                await self.say(uid,f"Xatolik #{r['id']} · {r['created']}\nUser ID: {r['user_id']}\nKino kodi: {r['code'] or 'o‘chirilgan'}\n{r['text']}",[[('✅ Hal qilindi',f"a:resolve_report:{r['id']}")]])
-            rows=[]; self.pager(rows,page,len(data)>PAGE,'a:reports:')
+                await self.bot.send_message(uid,f"Xatolik #{r['id']} · {r['created']}\nUser ID: {r['user_id']}\nKino kodi: {r['code'] or 'o‘chirilgan'}\n{r['text']}")
+                rows.append([(f"✅ #{r['id']} — hal qilindi",f"a:resolve_report:{r['id']}")])
+            self.pager(rows,page,len(data)>PAGE,'a:reports:')
             rows.append([('⬅️ Admin','admin')])
             await self.say(uid,'Xatoliklar ro‘yxati.' if data else 'Xatoliklar yo‘q.',rows)
 
@@ -668,8 +700,18 @@ class App:
             return {'file_id':m.document.file_id,'media_type':'document'}
         raise ValueError('Video yoki video turidagi fayl yuboring.')
 
-    async def message(self,m):
+    async def message(self,m,keyboard_input=True):
         uid=m.from_user.id
+        if keyboard_input and m.text:
+            keyboard=self.db.keyboard(uid)
+            action=(keyboard or {}).get('actions',{}).get(m.text.strip())
+            if action:
+                if action.startswith('https://'):
+                    # Reply keyboard buttons send text; URL opens from this message.
+                    await self.bot.send_message(uid,f'{m.text.strip()}\n{action}')
+                else:
+                    await self.dispatch_action(uid,action)
+                return
         state=self.db.state(uid)
         if not state:
             if m.text and m.text.startswith('/'):
@@ -795,7 +837,7 @@ class App:
 
     async def owner_notice(self,text):
         for owner in self.owners:
-            try: await self.say(owner,text)
+            try: await self.bot.send_message(owner,text)
             except TelegramAPIError: pass
 
     async def error(self,event:ErrorEvent):
@@ -824,8 +866,10 @@ class App:
                 return 'skipped'
             if not self.db.one('SELECT id FROM assets WHERE movie_id=? AND season=? AND episode=?',
                                (movie['id'],payload['season'],payload['episode'])): return 'skipped'
-            await self.say(uid,f"{movie['title']}: {payload['season']}-fasl, {payload['episode']}-qism qo‘shildi.",
-                           [[('▶️ Ko‘rish',f"variants:{movie['id']}:{payload['season']}:{payload['episode']}:0")]])
+            # Background notifications must not replace a user's active keyboard.
+            await self.bot.send_message(uid,
+                f"{movie['title']}: {payload['season']}-fasl, {payload['episode']}-qism qo‘shildi.\n"
+                f"https://t.me/{self.username}?start=film_{movie['code']}")
         return 'sent'
 
     async def queue_worker(self):

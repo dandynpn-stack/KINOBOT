@@ -58,6 +58,9 @@ CREATE TABLE IF NOT EXISTS channels (
  url TEXT NOT NULL, required INTEGER NOT NULL DEFAULT 0, source INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS states (user_id INTEGER PRIMARY KEY, payload TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS keyboards (
+ user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE, payload TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS reports (
  id INTEGER PRIMARY KEY, user_id INTEGER REFERENCES users(id),
  movie_id INTEGER REFERENCES movies(id) ON DELETE SET NULL, text TEXT, created TEXT
@@ -132,6 +135,14 @@ class Store:
         else:
             self.run('INSERT INTO states VALUES(?,?) ON CONFLICT(user_id) DO UPDATE SET payload=excluded.payload',
                      (uid, json.dumps(state, ensure_ascii=False)))
+
+    def keyboard(self, uid):
+        row=self.one('SELECT payload FROM keyboards WHERE user_id=?',(uid,))
+        return json.loads(row['payload']) if row else None
+
+    def set_keyboard(self, uid, keyboard):
+        self.run('INSERT INTO keyboards VALUES(?,?) ON CONFLICT(user_id) DO UPDATE SET payload=excluded.payload',
+                 (uid,json.dumps(keyboard,ensure_ascii=False)))
 
     def movie(self, mid, public=True):
         return self.one('SELECT * FROM movies WHERE id=?' + (' AND hidden=0' if public else ''), (mid,))

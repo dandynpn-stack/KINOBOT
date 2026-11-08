@@ -37,8 +37,9 @@ class UpgradeTests(unittest.IsolatedAsyncioTestCase):
         await self.app.callback(SimpleNamespace(from_user=SimpleNamespace(id=uid),data=data,
                                                 answer=answer or AsyncMock()))
 
-    def buttons(self):
-        return [b for row in self.bot.send_message.call_args.kwargs['reply_markup'].inline_keyboard for b in row]
+    def buttons(self,uid=1):
+        actions=self.db.keyboard(uid)['actions']
+        return [SimpleNamespace(text=b.text,callback_data=actions[b.text]) for row in self.bot.send_message.call_args.kwargs['reply_markup'].keyboard for b in row]
 
     async def test_expired_callback_ack_does_not_abort_action(self):
         expired=AsyncMock(side_effect=TelegramBadRequest(
@@ -53,9 +54,9 @@ class UpgradeTests(unittest.IsolatedAsyncioTestCase):
         button=next(b for b in self.buttons() if b.text=='🎬 Kino')
         await self.click(button.callback_data)
         self.assertEqual(self.db.state(1)['step'],3)
+        skip=next(b for b in self.buttons() if 'O‘tkazib' in b.text)
         await self.click(button.callback_data)
         self.assertEqual(self.db.state(1)['step'],3)
-        skip=next(b for b in self.bot.send_message.call_args_list[-2].kwargs['reply_markup'].inline_keyboard[-2] if 'O‘tkazib' in b.text)
         await self.click(skip.callback_data)
         self.assertEqual(self.db.state(1)['step'],4)
         self.assertEqual(self.db.state(1)['data']['genre'],'')
@@ -65,7 +66,7 @@ class UpgradeTests(unittest.IsolatedAsyncioTestCase):
         await self.app.admin_action(2,['add'])
         await self.app.message(self.msg('501',uid=2))
         await self.app.message(self.msg('Film',uid=2))
-        button=next(b for b in self.buttons() if b.text=='🎬 Kino')
+        button=next(b for b in self.buttons(2) if b.text=='🎬 Kino')
         self.db.run('DELETE FROM admins WHERE user_id=2')
         await self.click(button.callback_data,uid=2)
         self.assertIsNone(self.db.state(2))
@@ -112,7 +113,7 @@ class UpgradeTests(unittest.IsolatedAsyncioTestCase):
         next_id=self.db.add_asset(mid,asset(season=2,episode=1))
         await self.app.send_asset(2,next_id)
         markup=self.bot.send_video.call_args.kwargs['reply_markup']
-        callbacks=[b.callback_data for row in markup.inline_keyboard for b in row]
+        callbacks=[self.db.keyboard(2)['actions'][b.text] for row in markup.keyboard for b in row]
         self.assertIn(f'variants:{mid}:1:2:0',callbacks)
         self.db.run('UPDATE movies SET hidden=1 WHERE id=?',(mid,))
         await self.app.send_asset(2,next_id)

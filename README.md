@@ -2,6 +2,14 @@
 
 Python + aiogram 3 + SQLite asosida Telegram kino boti. Foydalanuvchi kino kodini yuboradi; bot majburiy obunani tekshiradi va videoni yetkazadi. Boshqaruv Telegram ichidagi tugmali admin panel orqali bajariladi.
 
+## Pastki keyboard menyulari
+
+Bosh menyu, admin panel, katalog, fasl/qism, til/sifat, baholash, sahifalash va tasdiqlash tugmalari yozish maydoni ostidagi doimiy **Reply Keyboard** orqali ishlaydi. Yangilangan menyuni ko‘rish uchun `/start` yuboring. Har sahifada bosh menyuga qaytish tugmasi bor.
+
+Kanal, treyler va do‘stga ulashish tugmasi bosilganda bosiladigan havola chatga yuboriladi. Har foydalanuvchining joriy tugmalari alohida bazada saqlanadi, restartdan keyin ham ishlaydi. Huquqlar amallar bajarilishida qayta tekshiriladi. Oldin yuborilgan inline tugmalar moslik uchun ishlashda davom etadi; yangi xabarlarga inline tugmalar qo‘shilmaydi.
+
+Admin kiritish bosqichlarida **Bekor qilish**, ixtiyoriy maydonlarda **O‘tkazib yuborish** tugmasi bor. Fon xabarnomalari joriy keyboardni almashtirmaydi. Zaxiradan tiklanganda eski tasdiqlash tugmalari tozalanadi; `/start` bilan yangi menyu ochiladi.
+
 ## Yangilanish: ishonchlilik va qulay boshqaruv
 
 - Bir foydalanuvchining xabarlari va tugma amallari ketma-ket bajariladi; boshqa foydalanuvchilar mustaqil ishlaydi. Bu tez yuborilgan javoblar admin bosqichlarini aralashtirishining oldini oladi.

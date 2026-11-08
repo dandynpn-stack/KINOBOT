@@ -37,6 +37,8 @@ def restore(source,database):
         with sqlite3.connect(database) as conn:
             conn.execute("UPDATE queue SET state='skipped' WHERE state IN ('pending','sending')")
             conn.execute('DELETE FROM states')
+            if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='keyboards'").fetchone():
+                conn.execute('DELETE FROM keyboards')
             conn.execute('UPDATE users SET pending=NULL')
     return previous
 
