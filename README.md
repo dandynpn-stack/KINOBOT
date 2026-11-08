@@ -1,16 +1,30 @@
-# Kino Bot
+# VELTO KINO
 
 Python + aiogram 3 + SQLite asosida Telegram kino boti. Foydalanuvchi kino kodini yuboradi; bot majburiy obunani tekshiradi va videoni yetkazadi. Boshqaruv Telegram ichidagi tugmali admin panel orqali bajariladi.
 
-**Holat:** kod va avtomatlashtirilgan testlar tayyor. Haqiqiy botda ishga tushirish uchun sizning `BOT_TOKEN` va `OWNER_IDS` qiymatlaringiz kerak. Token kiritilmagani sababli jonli Telegram akkaunti va haqiqiy kino fayllari bilan yakuniy tekshiruv hali bajarilmagan.
+## Yangilanish: ishonchlilik va qulay boshqaruv
+
+- Bir foydalanuvchining xabarlari va tugma amallari ketma-ket bajariladi; boshqa foydalanuvchilar mustaqil ishlaydi. Bu tez yuborilgan javoblar admin bosqichlarini aralashtirishining oldini oladi.
+- Kino turi, til va sifatni tugmalardan tanlash, ixtiyoriy maydonlarni tugma bilan o‘tkazish mumkin. Oldingi bosqich tugmalari yangi draftni o‘zgartirmaydi.
+- **Kod orqali boshqarish** yashirilgan kinoni ham topadi. Kanallar va administratorlar ro‘yxati sahifalanadi; kanalni o‘chirish tasdiqlanadi.
+- Kino haqida ma’lumotga qaytish videoni takroran yubormaydi. Serial videosidan oldingi/keyingi qismga, jumladan keyingi faslga o‘tish mumkin.
+- Uzoq, emoji ko‘p tavsif poster caption chegarasidan oshsa, alohida matn yuboriladi.
+- Obuna tekshiruvi bir vaqtda ko‘pi bilan 4 so‘rov bajaradi. Natija keshlanmaydi; API xatosida video ochilmaydi.
+- Qisqa Telegram flood-wait javobidan keyin video bir marta qayta yuborishga urinadi. Yetkazish statistikasi faqat muvaffaqiyatdan keyin yoziladi.
+- `/help` va **Yordam** tugmasi qo‘shilgan. Menyularga o‘tish oldingi draftni bekor qiladi; spam limitida tushunarli xabar chiqadi.
+- Admin xatolikni **Hal qilindi** deb belgilaydi. Xabar bazada qoladi, ochiq xatoliklar ro‘yxatidan chiqadi.
+- Tarix, baholar, seriallar va faollik so‘rovlari uchun indekslar qo‘shilgan. Eski baza ochilganda `reports.resolved` ustuni avtomatik qo‘shiladi; mavjud yozuvlar saqlanadi.
+- Navbat ishchisi to‘xtasa, jarayon xato bilan tugaydi va hostingning restart siyosati qo‘llanadi. Ishga tushishda xato bo‘lsa ham baza va jarayon qulfi yopiladi.
+
+Tezlik uchun “1000x” kafolati berilmaydi: bu yangilanish aniq xatolarni tuzatadi va boshqaruvni qulaylashtiradi. Avtomatik testlar real foydalanuvchilarga xabar yubormaydi.
 
 ## 1. Windows’da ishga tushirish
 
 Python 3.11 yoki 3.12 o‘rnating. PowerShell’da:
 
 ```powershell
-git clone https://github.com/Abdulkhak1mov/kinobot.git
-cd kinobot
+git clone https://github.com/dandynpn-stack/KINOBOT.git
+cd KINOBOT
 py -3.12 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 Copy-Item .env.example .env
@@ -23,7 +37,7 @@ notepad .env
 BOT_TOKEN=BOTFATHER_BERGAN_TOKEN
 OWNER_IDS=SIZNING_RAQAMLI_TELEGRAM_ID
 DATABASE_PATH=data/kino.db
-BOT_TITLE=Kino Bot
+BOT_TITLE=VELTO KINO
 TIMEZONE=Asia/Tashkent
 ```
 
@@ -72,7 +86,7 @@ docker compose logs -f bot
 8. Serial uchun fasl va qism raqami.
 9. Videoni yuboring. Shu bosqichda katalog va birinchi video birga saqlanadi.
 
-`/cancel` jarayonni bekor qiladi. Qolgan draftlar bazada saqlanadi, restartdan keyin davom ettirish mumkin. `/start` yoki admin bosh menyusi draftni bekor qiladi.
+Tanlash tugmalari bilan birga odatiy matn javoblari ham ishlaydi. `/cancel` jarayonni bekor qiladi. Qolgan draftlar bazada saqlanadi, restartdan keyin davom ettirish mumkin. `/start` yoki admin bosh menyusi draftni bekor qiladi.
 
 Yana til/sifat yoki serial qismi: **Katalogni boshqarish → kino → Video variant**. Bitta til + sifat + fasl + qism kombinatsiyasi takrorlanmaydi. Mavjud faylni **Videolarni boshqarish → Videoni almashtirish** orqali yangilang. Janr va davlat har bir kino uchun bitta qiymat; nomlarni bir xil yozish tavsiya qilinadi.
 
@@ -220,7 +234,7 @@ Tiklashdan oldin baza yaxlitligi va kerakli jadvallar tekshiriladi. Eski holat a
 
 ```bash
 python -m unittest discover -s tests -v
-python -m compileall -q .
+python -m compileall -q bot.py core.py storage.py runtime.py backup.py tests
 ```
 
 Testlar haqiqiy Telegram so‘rovlarini yubormaydi: Bot API javoblari test adapteri bilan almashtirilgan. Haqiqiy aiogram Dispatcher orqali deep-link va admin marshrutlari ham tekshiriladi. Qamrov: UNIQUE cheklovlar, tranzaksiya rollback, huquqlarni chetlab o‘tishga qarshi himoya, obuna statuslari/API xatosi, yashirilgan video, serial va sifatlar, avtoimport, navbatdagi opt-out/retry, zaxira/tiklash, spam va e’lonni ikki marta tasdiqlash.

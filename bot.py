@@ -4,27 +4,36 @@ import contextlib
 import json
 import logging
 import os
+import secrets
 import sqlite3
 import tempfile
 import time
+import traceback
 from collections import defaultdict, deque
+from types import SimpleNamespace
+from weakref import WeakValueDictionary
 from pathlib import Path
 from urllib.parse import quote
 
-from aiogram import Bot, Dispatcher, F, BaseMiddleware
-from aiogram.exceptions import TelegramAPIError, TelegramForbiddenError, TelegramRetryAfter
+from aiogram import Bot, Dispatcher, BaseMiddleware
+from aiogram.exceptions import TelegramAPIError, TelegramForbiddenError, TelegramRetryAfter, TelegramBadRequest
 from aiogram.filters import Command
 from aiogram.types import (Message, CallbackQuery, InlineKeyboardButton,
     InlineKeyboardMarkup, FSInputFile, BotCommand, ErrorEvent)
 from dotenv import load_dotenv
 
 from core import (FIELDS, WIZARD, OPTIONAL, allowed, code_value, validate,
-                  https_url, parse_channel_caption, is_member)
+                  https_url, parse_channel_caption, is_member, telegram_id, utf16_length)
 from storage import Store
 from runtime import InstanceLock
 
 log = logging.getLogger('kino_bot')
 PAGE = 8
+CHOICES = {
+    'kind': [('🎬 Kino', 'movie'), ('📺 Serial', 'series')],
+    'language': [('O‘zbekcha', 'O‘zbekcha'), ('Ruscha', 'Ruscha'), ('Inglizcha', 'Inglizcha')],
+    'quality': [('480p', '480p'), ('720p', '720p'), ('1080p', '1080p'), ('4K', '4K')],
+}
 
 def kb(rows):
     return InlineKeyboardMarkup(inline_keyboard=[[
@@ -39,6 +48,9 @@ class Guard(BaseMiddleware):
         self.app = app
         self.hits = defaultdict(deque)
         self.last_clean = 0.0
+        self.warned = {}
+        self.locks = WeakValueDictionary()
+        self.active = set()
 
     async def __call__(self, handler, event, data):
         if isinstance(event, Message) and event.chat.type != 'private':
@@ -51,40 +63,66 @@ class Guard(BaseMiddleware):
             for key in list(self.hits):
                 if not self.hits[key] or now-self.hits[key][-1] > 10:
                     del self.hits[key]
+                    self.warned.pop(key, None)
             self.last_clean = now
         q = self.hits[uid]
         while q and now-q[0] > 5:
             q.popleft()
         if len(q) >= 8:
             if isinstance(event, CallbackQuery):
-                await event.answer('Biroz kuting, so‘ng qayta bosing.', show_alert=True)
+                with contextlib.suppress(TelegramAPIError):
+                    await event.answer('Biroz kuting, so‘ng qayta bosing.', show_alert=True)
+            elif now-self.warned.get(uid, -10) > 5:
+                self.warned[uid] = now
+                with contextlib.suppress(TelegramAPIError):
+                    await event.answer('Juda tez yuboryapsiz. 5 soniyadan keyin davom eting.')
             return
         q.append(now)
-        user = self.app.db.touch(uid)
-        if user['blocked'] and uid not in self.app.owners:
-            if isinstance(event, CallbackQuery):
-                await event.answer('Botdan foydalanish cheklangan.',show_alert=True)
-            else:
-                await event.answer('Botdan foydalanish cheklangan.')
-            return
-        return await handler(event,data)
+        # Serialize a user's messages AND callbacks, while other users proceed.
+        lock = self.locks.setdefault(uid, asyncio.Lock())
+        task=asyncio.current_task()
+        self.active.add(task)
+        try:
+            async with lock:
+                user = self.app.db.touch(uid)
+                if user['blocked'] and uid not in self.app.owners:
+                    with contextlib.suppress(TelegramAPIError):
+                        if isinstance(event, CallbackQuery):
+                            await event.answer('Botdan foydalanish cheklangan.', show_alert=True)
+                        else:
+                            await event.answer('Botdan foydalanish cheklangan.')
+                    return
+                return await handler(event,data)
+        finally:
+            self.active.discard(task)
+
 
 class App:
     def __init__(self, bot, db, owners, title='Kino Bot'):
         self.bot, self.db, self.owners, self.title = bot, db, set(owners), title
         self.username = ''
+        self.membership_slots = asyncio.Semaphore(4)
         self.dp = Dispatcher()
-        guard = Guard(self)
+        guard = self.guard = Guard(self)
+        self.dp.shutdown.register(self.drain_updates)
         self.dp.message.outer_middleware(guard)
         self.dp.callback_query.outer_middleware(guard)
         self.dp.message.register(self.start, Command('start'))
         self.dp.message.register(self.cancel, Command('cancel'))
+        self.dp.message.register(self.help_command, Command('help'))
         self.dp.message.register(self.my_id, Command('id'))
         self.dp.message.register(self.admin_command, Command('admin'))
         self.dp.message.register(self.message)
         self.dp.callback_query.register(self.callback)
         self.dp.channel_post.register(self.channel_post)
         self.dp.errors.register(self.error)
+
+    async def drain_updates(self, **kwargs):
+        tasks=tuple(self.guard.active)
+        if tasks:
+            _, pending=await asyncio.wait(tasks,timeout=5)
+            for task in pending: task.cancel()
+            await asyncio.gather(*tasks,return_exceptions=True)
 
     def role(self, uid):
         return self.db.role(uid,self.owners)
@@ -95,8 +133,12 @@ class App:
     async def say(self, uid, text, rows=None):
         return await self.bot.send_message(uid,text,reply_markup=kb(rows) if rows else None)
 
+    def clear_flow(self, uid):
+        self.db.set_state(uid,None)
+        self.db.run('UPDATE users SET pending=NULL WHERE id=?',(uid,))
+
     async def start(self, m):
-        self.db.set_state(m.from_user.id,None)
+        self.clear_flow(m.from_user.id)
         arg = (m.text or '').split(maxsplit=1)
         if len(arg)==2 and arg[1].startswith('film_'):
             await self.open_code(m.from_user.id,arg[1][5:])
@@ -104,8 +146,20 @@ class App:
             await self.home(m.from_user.id)
 
     async def cancel(self,m):
-        self.db.set_state(m.from_user.id,None)
+        self.clear_flow(m.from_user.id)
         await self.home(m.from_user.id)
+
+    async def help_command(self,m):
+        self.clear_flow(m.from_user.id)
+        await self.help(m.from_user.id)
+
+    async def help(self,uid):
+        await self.say(uid,'Kino olish: kodini yozing, masalan 101.\n'
+                       'Yoki Kinolar bo‘limidan tanlang.\n'
+                       'Serial: fasl → qism → til va sifat.\n'
+                       'Obuna so‘ralsa, kanallarga kiring va Obunani tekshirish tugmasini bosing.\n\n'
+                       '/start — bosh menyu\n/cancel — joriy amalni bekor qilish\n'
+                       '/id — Telegram ID\n/admin — admin panel',[[('🏠 Menyu','home')]])
 
     async def my_id(self,m):
         await m.answer(f'Sizning Telegram ID: {m.from_user.id}')
@@ -115,21 +169,25 @@ class App:
                 [('🎭 Janr','filter:genre:0'),('📅 Yil','filter:year:0')],
                 [('🌍 Davlat','filter:country:0'),('📺 Seriallar','list:series:0:0')],
                 [('❤️ Sevimlilar','list:favorite:0:0'),('🕒 Keyin ko‘raman','list:later:0:0')],
-                [('📜 Tarix','list:history:0:0'),('🔔 Sozlamalar','settings')]]
+                [('📜 Tarix','list:history:0:0'),('🔔 Sozlamalar','settings')],
+                [('❓ Yordam','help')]]
         if self.role(uid):
             rows.append([('⚙️ Admin panel','admin')])
         await self.say(uid,f'{self.title}\n\nKino kodini yuboring yoki bo‘limni tanlang.',rows)
 
     async def gate(self,uid,action):
-        missing, failure = [],False
-        for ch in self.db.all('SELECT * FROM channels WHERE required=1 ORDER BY id'):
-            try:
-                member = await self.bot.get_chat_member(ch['chat_id'],uid)
-                if not is_member(member):
-                    missing.append(ch)
-            except TelegramAPIError:
-                failure=True
-                log.warning('Membership check unavailable, channel=%s',ch['chat_id'])
+        channels = self.db.all('SELECT * FROM channels WHERE required=1 ORDER BY id')
+        async def check(ch):
+            async with self.membership_slots:
+                try:
+                    member = await self.bot.get_chat_member(ch['chat_id'],uid)
+                    return ch, is_member(member)
+                except TelegramAPIError as exc:
+                    log.warning('Membership unavailable channel=%s error=%s',ch['chat_id'],type(exc).__name__)
+                    return ch, None
+        results = await asyncio.gather(*(check(ch) for ch in channels))
+        missing = [ch for ch, status in results if status is False]
+        failure = any(status is None for _, status in results)
         if not missing and not failure:
             self.db.run('UPDATE users SET pending=NULL WHERE id=?',(uid,))
             return True
@@ -145,18 +203,18 @@ class App:
     async def open_code(self,uid,code):
         try:
             code=code_value(code)
-        except ValueError as e:
-            await self.say(uid,str(e)); return
+        except (ValueError,OverflowError) as e:
+            await self.say(uid,str(e) if isinstance(e,ValueError) else 'Raqam juda katta. To‘g‘ri qiymat kiriting.'); return
         movie=self.db.by_code(code)
         if not movie:
             await self.say(uid,'Bu kod bo‘yicha kino topilmadi.'); return
         await self.card(uid,movie['id'])
 
-    async def card(self,uid,mid):
+    async def card(self,uid,mid,auto_send=True):
         movie=self.db.movie(mid)
         if not movie:
             await self.say(uid,'Kino mavjud emas yoki vaqtincha yashirilgan.'); return
-        if not await self.gate(uid,f'open:{mid}'):
+        if not await self.gate(uid,f"{'open' if auto_send else 'view'}:{mid}"):
             return
         score=self.db.one('SELECT AVG(score) avg,COUNT(*) n FROM ratings WHERE movie_id=?',(mid,))
         watched=self.db.one('SELECT COUNT(*) n FROM deliveries WHERE movie_id=?',(mid,))['n']
@@ -178,13 +236,17 @@ class App:
         rows.append([('🏠 Bosh menyu','home')])
         if movie['poster']:
             try:
-                await self.bot.send_photo(uid,movie['poster'],caption=text,reply_markup=kb(rows))
-            except TelegramAPIError:
+                if utf16_length(text) <= 1024:
+                    await self.bot.send_photo(uid,movie['poster'],caption=text,reply_markup=kb(rows))
+                else:
+                    await self.bot.send_photo(uid,movie['poster'],caption=movie['title'])
+                    await self.say(uid,text,rows)
+            except TelegramBadRequest:
                 await self.say(uid,text,rows)
         else:
             await self.say(uid,text,rows)
         variants=self.db.all('SELECT id FROM assets WHERE movie_id=?',(mid,))
-        if movie['kind']=='movie' and len(variants)==1:
+        if auto_send and movie['kind']=='movie' and len(variants)==1:
             await self.send_asset(uid,variants[0]['id'],check_gate=False)
 
     async def send_asset(self,uid,aid,check_gate=True):
@@ -197,9 +259,26 @@ class App:
         if asset['season']:
             caption+=f"\n{asset['season']}-fasl, {asset['episode']}-qism"
         sender=self.bot.send_video if asset['media_type']=='video' else self.bot.send_document
+        rows=[]
+        if asset['season']:
+            for label, op, order in [('⬅️ Oldingi qism','<','DESC'),('Keyingi qism ➡️','>','ASC')]:
+                neighbor=self.db.one(f'SELECT season,episode FROM assets WHERE movie_id=? '
+                    f'AND (season,episode) {op} (?,?) ORDER BY season {order},episode {order} LIMIT 1',
+                    (asset['movie_id'],asset['season'],asset['episode']))
+                if neighbor:
+                    rows.append([(label,f"variants:{asset['movie_id']}:{neighbor['season']}:{neighbor['episode']}:0")])
+        rows.append([('ℹ️ Kino haqida',f"view:{asset['movie_id']}"),('🏠 Menyu','home')])
         try:
-            await sender(uid,asset['file_id'],caption=caption)
-        except TelegramAPIError:
+            try:
+                await sender(uid,asset['file_id'],caption=caption,reply_markup=kb(rows))
+            except TelegramRetryAfter as exc:
+                if exc.retry_after > 3:
+                    await self.say(uid,f'Telegram band. {exc.retry_after} soniyadan keyin qayta urinib ko‘ring.')
+                    return
+                await asyncio.sleep(exc.retry_after+0.1)
+                await sender(uid,asset['file_id'],caption=caption,reply_markup=kb(rows))
+        except TelegramAPIError as exc:
+            log.warning('Delivery failed asset=%s error=%s',aid,type(exc).__name__)
             await self.say(uid,'Video yuborilmadi. Birozdan keyin qayta urinib ko‘ring yoki xatolik yuboring.',
                            [[('⚠️ Xatolik yuborish',f"report:{asset['movie_id']}")]])
             return
@@ -222,7 +301,7 @@ class App:
         items=[(f"{r['season']}-fasl",f"eps:{mid}:{r['season']}:0") for r in data[:PAGE]]
         rows=rows_of(items,2)
         self.pager(rows,page,len(data)>PAGE,f'seasons:{mid}:')
-        rows.append([('⬅️ Kino',f'open:{mid}')])
+        rows.append([('⬅️ Kino',f'view:{mid}')])
         await self.say(uid,'Faslni tanlang:' if data else 'Hali qismlar qo‘shilmagan.',rows)
 
     async def episodes(self,uid,mid,season,page):
@@ -240,7 +319,7 @@ class App:
                         (mid,season,episode,PAGE+1,page*PAGE))
         rows=[[(f"{a['language']} · {a['quality']}",f"asset:{a['id']}")] for a in data[:PAGE]]
         self.pager(rows,page,len(data)>PAGE,f'variants:{mid}:{season}:{episode}:')
-        rows.append([('⬅️ Kino',f'open:{mid}')])
+        rows.append([('⬅️ Kino',f'view:{mid}')])
         await self.say(uid,'Til va sifatni tanlang:' if data else 'Hozircha video qo‘shilmagan.',rows)
 
     @staticmethod
@@ -284,13 +363,14 @@ class App:
                        [[('🔔 '+('O‘chirish' if value else 'Yoqish'),'notify')],[('🏠 Menyu','home')]])
 
     async def admin_command(self,m):
-        self.db.set_state(m.from_user.id,None)
+        self.clear_flow(m.from_user.id)
         await self.admin_home(m.from_user.id)
 
     async def admin_home(self,uid):
         role=self.role(uid)
         if not role: await self.say(uid,'Bu bo‘lim faqat administratorlar uchun.'); return
         options=[('➕ Kino / serial qo‘shish','add','catalog'),('🎬 Katalogni boshqarish','manage:0','catalog'),
+                 ('🔎 Kod orqali boshqarish','lookup','catalog'),
                  ('📣 Kanallar','channels','channels'),('👤 Administratorlar','admins','admins'),
                  ('📊 Statistika','stats','stats'),('📨 Ommaviy xabar','broadcast','broadcast'),
                  ('🚫 Bloklash / ochish','block','block'),('💾 Zaxira nusxa','backup','backup'),
@@ -317,9 +397,36 @@ class App:
             [('📊 Kino statistikasi',f'a:movie_stats:{mid}')], [('⬅️ Katalog','a:manage:0')]])
 
     async def prompt_field(self,uid,field):
+        state=self.db.state(uid)
+        rows=[]
+        if state:
+            state['nonce']=secrets.token_hex(4)
+            self.db.set_state(uid,state)
+            prefix=f"w:{state['nonce']}:{field}:"
+            rows=rows_of([(label,prefix+value) for label,value in CHOICES.get(field,[])],2)
+            if field in OPTIONAL:
+                rows.append([('⏭ O‘tkazib yuborish',prefix+'/skip')])
+        rows.append([('✖️ Bekor qilish','admin')])
         suffix='\nO‘tkazish: /skip' if field in OPTIONAL else ''
-        await self.say(uid,FIELDS.get(field,{'language':'Til (masalan: O‘zbekcha)','quality':'Sifat (masalan: 720p)',
-                     'season':'Fasl raqami','episode':'Qism raqami'}.get(field,field))+':'+suffix+'\nBekor qilish: /cancel')
+        progress=''
+        if state and state['type']=='new':
+            progress=f"{state['step']+1}/{len(WIZARD)} · "
+        await self.say(uid,progress+FIELDS.get(field,{'language':'Til (masalan: O‘zbekcha)','quality':'Sifat (masalan: 720p)',
+                     'season':'Fasl raqami','episode':'Qism raqami'}.get(field,field))+':'+suffix+'\nBekor qilish: /cancel',rows)
+
+    async def wizard_choice(self,uid,p):
+        state=self.db.state(uid)
+        if not state or len(p)!=4 or state.get('nonce')!=p[1]:
+            await self.say(uid,'Bu bosqich tugagan. Oxirgi savolga javob bering yoki /cancel yozing.')
+            return
+        if state['type']=='new': field=WIZARD[state['step']]
+        elif state['type']=='edit': field=state['field']
+        elif state['type']=='asset' and state['step']<len(state['fields']): field=state['fields'][state['step']]
+        else: return
+        permitted={value for _,value in CHOICES.get(field,[])}
+        if field in OPTIONAL: permitted.add('/skip')
+        if p[2]!=field or p[3] not in permitted: return
+        await self.message(SimpleNamespace(from_user=SimpleNamespace(id=uid),text=p[3],photo=None))
 
     async def begin_asset(self,uid,mid,draft=None):
         m=draft or self.db.movie(mid,public=False)
@@ -330,11 +437,13 @@ class App:
         self.db.set_state(uid,state)
         await self.prompt_field(uid,fields[0])
 
-    async def channel_menu(self,uid):
+    async def channel_menu(self,uid,page=0):
         rows=[]
-        for c in self.db.all('SELECT * FROM channels ORDER BY id'):
+        channels=self.db.all('SELECT * FROM channels ORDER BY id LIMIT ? OFFSET ?',(PAGE+1,page*PAGE))
+        for c in channels[:PAGE]:
             flags=('obuna ' if c['required'] else '')+('import' if c['source'] else '')
             rows.append([(f"{c['title']} ({flags})",f"a:channel:{c['id']}")])
+        self.pager(rows,page,len(channels)>PAGE,'a:channels:')
         rows += [[('➕ Kanal qo‘shish','a:channel_add')],[('⬅️ Admin','admin')]]
         await self.say(uid,'Kanallar: obuna — majburiy a’zolik; import — #kino postlaridan qo‘shish.',rows)
 
@@ -355,15 +464,25 @@ class App:
 
     async def callback(self,c):
         uid=c.from_user.id
-        await c.answer()
+        with contextlib.suppress(TelegramAPIError):
+            await c.answer()
         p=(c.data or '').split(':')
         try:
+            if any(part.lstrip('-').isascii() and part.lstrip('-').isdigit() and
+                   (len(part)>16 or not 0 <= int(part) < 2**52) for part in p):
+                raise ValueError('Invalid callback number')
+            if p[0]=='w':
+                await self.wizard_choice(uid,p); return
+            if p[0] in ('home','admin','help','open','view','play','asset','list','filter','seasons','eps','variants','settings'):
+                self.clear_flow(uid)
             if p[0]=='a':
                 await self.admin_action(uid,p[1:]); return
             if p[0]=='home':
                 self.db.set_state(uid,None); await self.home(uid)
             elif p[0]=='admin':
                 self.db.set_state(uid,None); await self.admin_home(uid)
+            elif p[0]=='help': await self.help(uid)
+            elif p[0]=='view': await self.card(uid,int(p[1]),auto_send=False)
             elif p[0]=='open': await self.card(uid,int(p[1]))
             elif p[0]=='play': await self.play(uid,int(p[1]))
             elif p[0]=='asset': await self.send_asset(uid,int(p[1]))
@@ -378,6 +497,7 @@ class App:
                 if await self.gate(uid,action):
                     kind,_,value=action.partition(':')
                     if kind=='open': await self.card(uid,int(value))
+                    elif kind=='view': await self.card(uid,int(value),auto_send=False)
                     elif kind=='asset': await self.send_asset(uid,int(value))
                     elif kind=='play': await self.play(uid,int(value))
                     else: await self.home(uid)
@@ -386,7 +506,7 @@ class App:
                 if not movie: await self.say(uid,'Kino topilmadi.'); return
                 if p[1]=='follow' and movie['kind']!='series': return
                 active=self.db.mark(uid,mid,p[1])
-                await self.say(uid,'Ro‘yxatga qo‘shildi.' if active else 'Ro‘yxatdan olib tashlandi.',[[('⬅️ Kino',f'open:{mid}')]])
+                await self.say(uid,'Ro‘yxatga qo‘shildi.' if active else 'Ro‘yxatdan olib tashlandi.',[[('⬅️ Kino',f'view:{mid}')]])
             elif p[0]=='rate':
                 mid=int(p[1])
                 if not self.db.movie(mid): return
@@ -405,22 +525,27 @@ class App:
             elif p[0]=='notify':
                 self.db.run('UPDATE users SET notifications=1-notifications WHERE id=?',(uid,))
                 await self.settings(uid)
-        except (ValueError,IndexError):
+        except (ValueError,IndexError,OverflowError):
             await self.say(uid,'Bu tugma eskirgan. /start orqali qayta kiring.')
 
     async def admin_action(self,uid,p):
         action=p[0]
         permissions={
-            'channels':'channels','channel':'channels','channel_add':'channels','channel_toggle':'channels','channel_delete':'channels',
+            'channels':'channels','channel':'channels','channel_add':'channels','channel_toggle':'channels','channel_delete':'channels','channel_delete_yes':'channels',
             'admins':'admins','admin_add':'admins','admin_remove':'admins',
             'broadcast':'broadcast','broadcast_send':'broadcast','stats':'stats','block':'block','backup':'backup',
             'movie_stats':'stats',
         }
         if not self.permit(uid,permissions.get(action,'catalog')):
             await self.say(uid,'Bu amal uchun huquqingiz yo‘q.'); return
+        if action!='broadcast_send':
+            self.db.set_state(uid,None)
         if action=='add':
             self.db.set_state(uid,{'type':'new','permission':'catalog','step':0,'data':{}})
             await self.prompt_field(uid,WIZARD[0])
+        elif action=='lookup':
+            self.db.set_state(uid,{'type':'lookup','permission':'catalog'})
+            await self.say(uid,'Boshqarish uchun kino kodini yuboring. /cancel — bekor qilish.')
         elif action=='manage': await self.managed_movies(uid,max(0,int(p[1])))
         elif action=='movie': await self.managed_movie(uid,int(p[1]))
         elif action=='edit':
@@ -467,7 +592,7 @@ class App:
             await self.say(uid,'Ushbu video variantini o‘chirasizmi?',[[('Ha, o‘chirish',f'a:asset_delete_yes:{int(p[1])}'),('Bekor qilish','a:manage:0')]])
         elif action=='asset_delete_yes':
             self.db.run('DELETE FROM assets WHERE id=?',(int(p[1]),)); await self.say(uid,'Video varianti o‘chirildi.')
-        elif action=='channels': await self.channel_menu(uid)
+        elif action=='channels': await self.channel_menu(uid,max(0,int(p[1])) if len(p)>1 else 0)
         elif action=='channel_add':
             self.db.set_state(uid,{'type':'channel','permission':'channels'})
             await self.say(uid,'Botni kanalga admin qiling. So‘ng 3 qatorda yuboring:\n\n@kanal_username yoki -100... ID\nhttps://t.me/kanal yoki taklif havolasi\nKanal nomi\n\nSaqlangach, obuna/import rejimini tugmadan yoqing.')
@@ -484,10 +609,15 @@ class App:
             self.db.run(f'UPDATE channels SET {field}=1-{field} WHERE id=?',(cid,))
             await self.admin_action(uid,['channel',str(cid)])
         elif action=='channel_delete':
+            await self.say(uid,'Kanalni obuna va import ro‘yxatidan o‘chirasizmi?',
+                           [[('Ha, o‘chirish',f'a:channel_delete_yes:{int(p[1])}'),('Bekor qilish','a:channels')]])
+        elif action=='channel_delete_yes':
             self.db.run('DELETE FROM channels WHERE id=?',(int(p[1]),)); await self.channel_menu(uid)
         elif action=='admins':
-            admins=self.db.all('SELECT * FROM admins ORDER BY user_id')
-            rows=[[(f"{a['user_id']} · {a['role']} — olib tashlash",f"a:admin_remove:{a['user_id']}")] for a in admins]
+            page=max(0,int(p[1])) if len(p)>1 else 0
+            admins=self.db.all('SELECT * FROM admins ORDER BY user_id LIMIT ? OFFSET ?',(PAGE+1,page*PAGE))
+            rows=[[(f"{a['user_id']} · {a['role']} — olib tashlash",f"a:admin_remove:{a['user_id']}")] for a in admins[:PAGE]]
+            self.pager(rows,page,len(admins)>PAGE,'a:admins:')
             rows += [[('➕ Qo‘shish / rolni o‘zgartirish','a:admin_add')],[('⬅️ Panel','admin')]]
             await self.say(uid,'Egalari: '+', '.join(map(str,sorted(self.owners)))+'\nRollar: manager yoki editor.',rows)
         elif action=='admin_add':
@@ -519,11 +649,14 @@ class App:
                 # Independent connection in a worker avoids blocking the event loop.
                 await asyncio.to_thread(backup_file,self.db.path,path)
                 await self.bot.send_document(uid,FSInputFile(path),caption='Katalog va sozlamalar zaxirasi. Tiklash: README.md.')
+        elif action=='resolve_report':
+            self.db.run('UPDATE reports SET resolved=1 WHERE id=?',(int(p[1]),))
+            await self.say(uid,'Xatolik hal qilingan deb belgilandi.',[[('⬅️ Xatoliklar','a:reports:0')]])
         elif action=='reports':
             page=max(0,int(p[1]))
-            data=self.db.all('SELECT r.*,m.code FROM reports r LEFT JOIN movies m ON m.id=r.movie_id ORDER BY r.id DESC LIMIT ? OFFSET ?',(PAGE+1,page*PAGE))
+            data=self.db.all('SELECT r.*,m.code FROM reports r LEFT JOIN movies m ON m.id=r.movie_id WHERE r.resolved=0 ORDER BY r.id DESC LIMIT ? OFFSET ?',(PAGE+1,page*PAGE))
             for r in data[:PAGE]:
-                await self.say(uid,f"Xatolik #{r['id']} · {r['created']}\nUser ID: {r['user_id']}\nKino kodi: {r['code'] or 'o‘chirilgan'}\n{r['text']}")
+                await self.say(uid,f"Xatolik #{r['id']} · {r['created']}\nUser ID: {r['user_id']}\nKino kodi: {r['code'] or 'o‘chirilgan'}\n{r['text']}",[[('✅ Hal qilindi',f"a:resolve_report:{r['id']}")]])
             rows=[]; self.pager(rows,page,len(data)>PAGE,'a:reports:')
             rows.append([('⬅️ Admin','admin')])
             await self.say(uid,'Xatoliklar ro‘yxati.' if data else 'Xatoliklar yo‘q.',rows)
@@ -539,7 +672,9 @@ class App:
         uid=m.from_user.id
         state=self.db.state(uid)
         if not state:
-            if m.text: await self.open_code(uid,m.text)
+            if m.text and m.text.startswith('/'):
+                await self.say(uid,'Noma’lum buyruq. /help orqali yordamni oching.')
+            elif m.text: await self.open_code(uid,m.text)
             else: await self.say(uid,'Kino kodini yuboring. Admin bo‘lsangiz: /admin')
             return
         if state.get('permission') and not self.permit(uid,state['permission']):
@@ -547,7 +682,12 @@ class App:
         text=(m.text or '').strip()
         kind=state['type']
         try:
-            if kind=='new':
+            if kind=='lookup':
+                movie=self.db.by_code(code_value(text),public=False)
+                if not movie: raise ValueError('Bu kod topilmadi. Boshqa kod kiriting.')
+                self.db.set_state(uid,None)
+                await self.managed_movie(uid,movie['id'])
+            elif kind=='new':
                 field=WIZARD[state['step']]
                 value=m.photo[-1].file_id if field=='poster' and m.photo else validate(field,text)
                 if field=='code' and self.db.by_code(value,False):
@@ -582,6 +722,9 @@ class App:
                 self.db.set_state(uid,None); await self.managed_movie(uid,state['mid'])
             elif kind=='replace':
                 media=self.media(m)
+                if not self.db.one('SELECT id FROM assets WHERE id=?',(state['aid'],)):
+                    self.db.set_state(uid,None)
+                    raise ValueError('Bu video o‘chirilgan. Katalogdan qayta tanlang.')
                 self.db.run('UPDATE assets SET file_id=?,media_type=? WHERE id=?',(media['file_id'],media['media_type'],state['aid']))
                 self.db.set_state(uid,None); await self.say(uid,'Video yangilandi.')
             elif kind=='channel':
@@ -601,9 +744,9 @@ class App:
                 self.db.set_state(uid,None); await self.channel_menu(uid)
             elif kind=='admin':
                 parts=text.split()
-                if len(parts)!=2 or not parts[0].isdigit() or int(parts[0])<1 or parts[1] not in ('manager','editor'):
+                if len(parts)!=2 or parts[1] not in ('manager','editor'):
                     raise ValueError('Misol: 123456789 editor yoki 123456789 manager')
-                target=int(parts[0])
+                target=telegram_id(parts[0])
                 if target in self.owners: raise ValueError('Eganing roli .env orqali belgilanadi.')
                 self.db.run('INSERT INTO admins VALUES(?,?) ON CONFLICT(user_id) DO UPDATE SET role=excluded.role',(target,parts[1]))
                 self.db.set_state(uid,None); await self.admin_action(uid,['admins'])
@@ -611,7 +754,7 @@ class App:
                 parts=text.split()
                 if len(parts)!=2 or not parts[0].isdigit() or parts[1] not in ('block','unblock'):
                     raise ValueError('Misol: 123456789 block yoki 123456789 unblock')
-                target=int(parts[0])
+                target=telegram_id(parts[0])
                 if self.role(target): raise ValueError('Administratorni bloklashdan avval uning rolini olib tashlang.')
                 if not self.db.one('SELECT id FROM users WHERE id=?',(target,)): raise ValueError('Bu foydalanuvchi botni hali ochmagan.')
                 self.db.run('UPDATE users SET blocked=? WHERE id=?',(int(parts[1]=='block'),target))
@@ -632,8 +775,8 @@ class App:
             elif kind=='broadcast_confirm': await self.say(uid,'Tasdiqlash tugmasini bosing yoki /cancel yozing.')
         except sqlite3.IntegrityError:
             await self.say(uid,'Bu kod yoki shu til/sifat/fasl/qismdagi video allaqachon mavjud. Boshqa qiymat kiriting yoki /cancel bilan chiqib, mavjud videoni tahrirlang.')
-        except ValueError as e:
-            await self.say(uid,str(e))
+        except (ValueError,OverflowError) as e:
+            await self.say(uid,str(e) if isinstance(e,ValueError) else 'Raqam juda katta. To‘g‘ri qiymat kiriting.')
         except TelegramAPIError:
             await self.say(uid,'Telegram amalni bajarmadi. Kanal, bot huquqlari yoki yuborilgan faylni tekshiring.')
 
@@ -656,7 +799,9 @@ class App:
             except TelegramAPIError: pass
 
     async def error(self,event:ErrorEvent):
-        log.error('Update failed: %s',type(event.exception).__name__)
+        # Stack locations aid diagnosis; exception text may contain private URLs.
+        log.error('Update failed: %s\n%s',type(event.exception).__name__,
+                  ''.join(traceback.format_tb(event.exception.__traceback__)))
         update=event.update
         uid=update.message.from_user.id if update.message and update.message.from_user else (
             update.callback_query.from_user.id if update.callback_query else None)
@@ -719,34 +864,43 @@ async def main():
     if not token:
         raise SystemExit('BOT_TOKEN kiritilmagan. .env.example ni .env ga nusxalab to‘ldiring.')
     try:
-        owners={int(x.strip()) for x in os.getenv('OWNER_IDS','').split(',') if x.strip()}
+        owners={telegram_id(x) for x in os.getenv('OWNER_IDS','').split(',') if x.strip()}
         if not owners or min(owners)<1: raise ValueError
     except ValueError:
         raise SystemExit('OWNER_IDS ichiga o‘zingizning raqamli Telegram ID raqamingizni yozing.')
     database_path=os.getenv('DATABASE_PATH','data/kino.db')
-    lock=InstanceLock(database_path)
-    lock.acquire()
-    db=Store(database_path,os.getenv('TIMEZONE','Asia/Tashkent'))
-    async with Bot(token) as bot:
-        me=await bot.get_me()
-        app=App(bot,db,owners,os.getenv('BOT_TITLE','Kino Bot'))
-        app.username=me.username
-        webhook=await bot.get_webhook_info()
-        if webhook.url:
-            raise SystemExit('Botda webhook faol. Avval oldingi xizmatni to‘xtatib, webhookni olib tashlang.')
-        await bot.set_my_commands([BotCommand(command='start',description='Bosh menyu'),
-                                  BotCommand(command='admin',description='Admin panel'),
-                                  BotCommand(command='id',description='Telegram ID'),
-                                  BotCommand(command='cancel',description='Amalni bekor qilish')])
-        worker=asyncio.create_task(app.queue_worker())
-        log.info('Bot started: @%s',me.username)
-        try:
-            await app.dp.start_polling(bot,allowed_updates=['message','callback_query','channel_post'],close_bot_session=False)
-        finally:
-            worker.cancel()
-            with contextlib.suppress(asyncio.CancelledError): await worker
-            db.close()
-            lock.release()
+    with InstanceLock(database_path), contextlib.closing(Store(database_path,os.getenv('TIMEZONE','Asia/Tashkent'))) as db:
+        async with Bot(token) as bot:
+            await run_bot(bot,db,owners)
+
+async def run_bot(bot,db,owners):
+    me=await bot.get_me()
+    app=App(bot,db,owners,os.getenv('BOT_TITLE','Kino Bot'))
+    app.username=me.username
+    webhook=await bot.get_webhook_info()
+    if webhook.url:
+        raise SystemExit('Botda webhook faol. Avval oldingi xizmatni to‘xtatib, webhookni olib tashlang.')
+    await bot.set_my_commands([BotCommand(command='start',description='Bosh menyu'),
+                              BotCommand(command='help',description='Yordam'),
+                              BotCommand(command='admin',description='Admin panel'),
+                              BotCommand(command='id',description='Telegram ID'),
+                              BotCommand(command='cancel',description='Amalni bekor qilish')])
+    worker=asyncio.create_task(app.queue_worker(),name='delivery-queue')
+    polling=asyncio.create_task(app.dp.start_polling(bot,
+        allowed_updates=['message','callback_query','channel_post'],
+        close_bot_session=False,tasks_concurrency_limit=64),name='telegram-polling')
+    log.info('Bot started: @%s',me.username)
+    try:
+        done,_=await asyncio.wait((worker,polling),return_when=asyncio.FIRST_COMPLETED)
+        for task in done:
+            task.result()  # Let the host restart the bot if either service fails.
+    finally:
+        worker.cancel()
+        if not polling.done():
+            with contextlib.suppress(RuntimeError,asyncio.TimeoutError):
+                await asyncio.wait_for(app.dp.stop_polling(),timeout=10)
+        polling.cancel()
+        await asyncio.gather(worker,polling,return_exceptions=True)
 
 if __name__=='__main__':
     logging.basicConfig(level=logging.INFO,format='%(asctime)s %(levelname)s %(name)s: %(message)s')

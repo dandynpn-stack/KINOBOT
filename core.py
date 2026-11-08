@@ -95,3 +95,16 @@ def is_member(member):
     status = getattr(member.status, 'value', member.status)
     return status in ('creator', 'administrator', 'member') or (
         status == 'restricted' and bool(getattr(member, 'is_member', False)))
+
+
+def telegram_id(value):
+    value = value.strip()
+    if not value.isascii() or not value.isdigit() or len(value) > 16:
+        raise ValueError('Telegram ID musbat raqam bo‘lsin (masalan: 5771496552).')
+    result = int(value)
+    if not 0 < result < 2**52:
+        raise ValueError('Telegram ID noto‘g‘ri.')
+    return result
+
+def utf16_length(text):
+    return len(text.encode('utf-16-le')) // 2

@@ -47,6 +47,12 @@ CREATE TABLE IF NOT EXISTS deliveries (
  movie_id INTEGER REFERENCES movies(id) ON DELETE CASCADE, sent_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS deliveries_movie ON deliveries(movie_id);
+CREATE INDEX IF NOT EXISTS deliveries_user_movie ON deliveries(user_id,movie_id,id);
+CREATE INDEX IF NOT EXISTS ratings_movie ON ratings(movie_id);
+CREATE INDEX IF NOT EXISTS activity_day ON activity(day);
+CREATE INDEX IF NOT EXISTS movies_visible ON movies(hidden,id);
+CREATE INDEX IF NOT EXISTS assets_episode ON assets(movie_id,season,episode);
+CREATE INDEX IF NOT EXISTS marks_follow ON marks(movie_id,kind,user_id);
 CREATE TABLE IF NOT EXISTS channels (
  id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER UNIQUE NOT NULL, title TEXT NOT NULL,
  url TEXT NOT NULL, required INTEGER NOT NULL DEFAULT 0, source INTEGER NOT NULL DEFAULT 0
@@ -80,6 +86,12 @@ class Store:
         self.conn = sqlite3.connect(self.path, timeout=15)
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(SCHEMA)
+        # Additive migration: preserve existing production data and old backups.
+        columns = {r['name'] for r in self.conn.execute('PRAGMA table_info(reports)')}
+        with self.conn:
+            if 'resolved' not in columns:
+                self.conn.execute('ALTER TABLE reports ADD COLUMN resolved INTEGER NOT NULL DEFAULT 0')
+            self.conn.execute('CREATE INDEX IF NOT EXISTS reports_status ON reports(resolved,id)')
 
     def now(self):
         return datetime.now(self.timezone).isoformat(timespec='seconds')
