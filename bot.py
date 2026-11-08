@@ -6,6 +6,7 @@ import logging
 import os
 import secrets
 import sqlite3
+import psycopg2
 import tempfile
 import time
 import traceback
@@ -815,7 +816,7 @@ class App:
                 await self.say(uid,'Yuqoridagi e’lonni xabarnomalari yoqilgan foydalanuvchilarga yuborilsinmi?',
                                [[('📨 Yuborish',f'a:broadcast_send:{m.message_id}'),('Bekor qilish','admin')]])
             elif kind=='broadcast_confirm': await self.say(uid,'Tasdiqlash tugmasini bosing yoki /cancel yozing.')
-        except sqlite3.IntegrityError:
+        except psycopg2.IntegrityError:
             await self.say(uid,'Bu kod yoki shu til/sifat/fasl/qismdagi video allaqachon mavjud. Boshqa qiymat kiriting yoki /cancel bilan chiqib, mavjud videoni tahrirlang.')
         except (ValueError,OverflowError) as e:
             await self.say(uid,str(e) if isinstance(e,ValueError) else 'Raqam juda katta. To‘g‘ri qiymat kiriting.')
@@ -832,7 +833,7 @@ class App:
             mid=self.db.import_post(m.chat.id,m.message_id,data)
             if mid:
                 await self.owner_notice(f"Avtoimport: {data['title']} · {data['code']} saqlandi.")
-        except (ValueError,sqlite3.IntegrityError) as e:
+        except (ValueError,psycopg2.IntegrityError) as e:
             await self.owner_notice(f'Avtoimport xatosi: kanal {m.chat.id}, post {m.message_id}.\n{e}')
 
     async def owner_notice(self,text):
@@ -912,10 +913,14 @@ async def main():
         if not owners or min(owners)<1: raise ValueError
     except ValueError:
         raise SystemExit('OWNER_IDS ichiga o‘zingizning raqamli Telegram ID raqamingizni yozing.')
-    database_path=os.getenv('DATABASE_PATH','data/kino.db')
-    with InstanceLock(database_path), contextlib.closing(Store(database_path,os.getenv('TIMEZONE','Asia/Tashkent'))) as db:
+    dsn = os.getenv('DATABASE_URL', '').strip()
+    if not dsn:
+        raise SystemExit('DATABASE_URL kiritilmagan. Supabase connection string ni .env ga yozing.')
+    # Local file lock still prevents two polling processes on same host.
+    lock_path = os.getenv('INSTANCE_LOCK', 'data/bot.lock')
+    with InstanceLock(lock_path), contextlib.closing(Store(dsn, os.getenv('TIMEZONE', 'Asia/Tashkent'))) as db:
         async with Bot(token) as bot:
-            await run_bot(bot,db,owners)
+            await run_bot(bot, db, owners)
 
 async def run_bot(bot,db,owners):
     me=await bot.get_me()
