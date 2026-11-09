@@ -183,7 +183,7 @@ class App:
 
     async def help(self,uid):
         await self.say(uid,'Kino olish: kodini yozing, masalan 101.\n'
-                       'Yoki Kinolar bo‘limidan tanlang.\n'
+                       'Yoki «Kino olish» tugmasini bosing.\n'
                        'Serial: fasl → qism → til va sifat.\n'
                        'Obuna so‘ralsa, kanallarga kiring va Obunani tekshirish tugmasini bosing.\n\n'
                        '/start — bosh menyu\n/cancel — joriy amalni bekor qilish\n'
@@ -193,15 +193,11 @@ class App:
         await m.answer(f'Sizning Telegram ID: {m.from_user.id}')
 
     async def home(self,uid):
-        rows = [[('🎬 Kinolar','list:all:0:0'),('🔥 Ommabop','list:top:0:0')],
-                [('🎭 Janr','filter:genre:0'),('📅 Yil','filter:year:0')],
-                [('🌍 Davlat','filter:country:0'),('📺 Seriallar','list:series:0:0')],
-                [('❤️ Sevimlilar','list:favorite:0:0'),('🕒 Keyin ko‘raman','list:later:0:0')],
-                [('📜 Tarix','list:history:0:0'),('🔔 Sozlamalar','settings')],
+        rows = [[('🎬 Kino olish','ask_code')],
                 [('❓ Yordam','help')]]
         if self.role(uid):
             rows.append([('⚙️ Admin panel','admin')])
-        await self.say(uid,f'{self.title}\n\nKino kodini yuboring yoki bo‘limni tanlang.',rows)
+        await self.say(uid,f'{self.title}\n\nKino olish uchun kodni yuboring yoki tugmani bosing.',rows)
 
     async def gate(self,uid,action):
         channels = self.db.all('SELECT * FROM channels WHERE required=1 ORDER BY id')
@@ -504,10 +500,13 @@ class App:
                 raise ValueError('Invalid callback number')
             if p[0]=='w':
                 await self.wizard_choice(uid,p); return
-            if p[0] in ('home','admin','help','open','view','play','asset','list','filter','seasons','eps','variants','settings'):
+            if p[0] in ('home','admin','help','ask_code','open','view','play','asset','list','filter','seasons','eps','variants','settings'):
                 self.clear_flow(uid)
             if p[0]=='a':
                 await self.admin_action(uid,p[1:]); return
+            if p[0]=='ask_code':
+                await self.say(uid,'Kino kodini yuboring (masalan: 101).')
+                return
             if p[0]=='home':
                 self.db.set_state(uid,None); await self.home(uid)
             elif p[0]=='admin':
